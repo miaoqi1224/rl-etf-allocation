@@ -32,9 +32,3 @@ The RL allocator achieved the **highest total and annualized returns** on the ou
 # Requires: quantmod, xts, zoo, quadprog, ggplot2, dplyr, readr, knitr, rmarkdown
 rmarkdown::render("rl_project_final_report.Rmd")
 ```
-
-## Team
-
-Jinyu Li, Zijun Ye, Miao Qi, Yidi An, Yang Ma — STAT GR5291 final project, Columbia University.
-
-Miao's focus: feature engineering pipeline (10 years of daily ETF features), risk-sensitive reward design, and benchmark evaluation.
