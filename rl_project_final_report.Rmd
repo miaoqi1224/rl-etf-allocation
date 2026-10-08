@@ -1,0 +1,349 @@
+---
+title: "Dynamic Multi-Asset ETF Allocation with Risk-Sensitive Reinforcement Learning"
+author: "Jinyu Li, Zijun Ye, Miao Qi, Yidi An, Yang Ma"
+date: "March 11, 2026"
+output:
+  pdf_document:
+    latex_engine: pdflatex
+geometry: margin=1in
+fontsize: 11pt
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, fig.align = "center")
+library(readr)
+library(dplyr)
+library(knitr)
+```
+
+## Abstract
+
+This project studies daily dynamic allocation across four exchange-traded funds: SPY, TQQQ, TLT, and GLD. Using approximately ten years of daily adjusted close data from March 11, 2016 to March 10, 2026, we construct a risk-sensitive reinforcement learning framework for tactical allocation and compare it with traditional portfolio rules. The main contribution is not only the final allocation result, but also a transparent formulation of the policy, the reward function, the iterative update, and the parameter-selection logic. The empirical results show a clear trade-off. The reinforcement learning strategy achieves the highest total return on the out-of-sample test set, but traditional risk-controlled models such as inverse-volatility and minimum-variance deliver higher Sharpe ratios and much smaller drawdowns. This suggests that reinforcement learning is useful for adaptive timing and allocation, but it does not fully replace classical portfolio construction methods.
+
+## 1. Why We Use R Packages but Do Not Rely on a Single "Built-In RL Package"
+
+Yes, R packages can and should be used in this project. In this report we use R for:
+
+- data ingestion and synchronization
+- rolling feature construction
+- benchmark backtesting
+- numerical optimization
+- figure generation
+- PDF report generation
+
+The practical toolkit is:
+
+- `quantmod` and `xts` for price data and time-series manipulation
+- `zoo` for rolling statistics
+- `quadprog` for the minimum-variance benchmark
+- `ggplot2` for all figures
+- `rmarkdown` for the final PDF
+
+However, there is no standard R package that directly provides the exact model we need: a transparent, risk-sensitive, long-only, multi-asset reinforcement learning allocator with custom drawdown and turnover penalties. For a course project, this is actually an advantage. By coding the policy, reward, and update rule ourselves, we can explicitly show the model formula, the training iteration, and the economic meaning of each penalty term.
+
+## 2. Data and Sample Split
+
+The data consist of daily adjusted closing prices for:
+
+- SPY: broad U.S. equities
+- TQQQ: leveraged Nasdaq exposure
+- TLT: long-term U.S. Treasury bonds
+- GLD: gold
+
+Returns are calculated from adjusted prices. The sample is divided chronologically into train, validation, and test sets.
+
+```{r split-table}
+split_table <- read_csv("outputs/split_table.csv", show_col_types = FALSE)
+kable(split_table, digits = 4, caption = "Chronological Data Split")
+```
+
+This design ensures that the final test results remain genuinely out of sample.
+
+## 3. Feature Construction from Daily Data
+
+To turn ten years of daily data into a state representation suitable for sequential decision-making, we compute the following features for each asset:
+
+- 1-day return
+- 5-day return
+- 20-day return
+- 60-day return
+- 20-day rolling volatility
+- 60-day rolling volatility
+- 20-day downside deviation
+- 60-day rolling drawdown
+
+We also include six 20-day rolling cross-asset correlations:
+
+- SPY-TQQQ
+- SPY-TLT
+- SPY-GLD
+- TQQQ-TLT
+- TQQQ-GLD
+- TLT-GLD
+
+In addition, the state contains portfolio context:
+
+- previous portfolio weights
+- current portfolio value
+- current portfolio drawdown
+
+Therefore the state vector combines market state and portfolio state.
+
+## 4. RL Formulation
+
+### 4.1 State
+
+Let $s_t$ denote the state at day $t$:
+
+$$
+s_t = [x_t, w_{t-1}, V_t, DD_t]
+$$
+
+where $x_t$ contains all rolling return and risk features, $w_{t-1}$ is the previous portfolio weight vector, $V_t$ is the portfolio value, and $DD_t$ is the current drawdown.
+
+### 4.2 Policy and Action
+
+We use a linear stochastic policy over action logits:
+
+$$
+\mu_t = W^\top s_t + b
+$$
+
+$$
+a_t = \mu_t + \sigma \varepsilon_t, \quad \varepsilon_t \sim \mathcal{N}(0, I)
+$$
+
+The logits are mapped into long-only portfolio weights:
+
+$$
+\tilde{w}_t = \text{softmax}(a_t), \quad w_t = \Pi(\tilde{w}_t)
+$$
+
+where $\Pi(\cdot)$ clips each weight to the interval $[0, w_{\max}]$ and renormalizes the vector so that the weights sum to one. In the implementation, $w_{\max} = 0.70$.
+
+### 4.3 Portfolio Return and Reward
+
+After rebalancing, the realized portfolio return is
+
+$$
+r^p_{t+1} = w_t^\top r_{t+1} - c \lVert w_t - w_{t-1} \rVert_1
+$$
+
+where $c$ is the transaction-cost coefficient.
+
+The reward is
+
+$$
+R_t = r^p_{t+1} - \lambda (r^p_{t+1})^2 + \phi DD_{t+1} - \eta TO_t
+$$
+
+where:
+
+- $\lambda$ penalizes unstable or excessively aggressive returns
+- $\phi$ penalizes deeper drawdown
+- $\eta$ penalizes turnover
+- $TO_t = \lVert w_t - w_{t-1} \rVert_1$
+
+This reward is designed to balance return, risk, and trading friction.
+
+### 4.4 Iterative Training Update
+
+The model is trained with a REINFORCE-style policy-gradient update. Let
+
+$$
+G_t = \sum_{j=t}^{T} \gamma^{j-t} R_j
+$$
+
+be the reward-to-go and let $A_t$ be the centered and standardized version of $G_t$. The parameter update is:
+
+$$
+\theta_{k+1}
+= \theta_k
++ \alpha \frac{1}{T} \sum_{t=1}^{T} A_t \nabla_\theta \log \pi_\theta(a_t \mid s_t)
+$$
+
+with
+
+$$
+\nabla_{\mu_t} \log \pi_\theta(a_t \mid s_t)
+= \frac{a_t - \mu_t}{\sigma^2}
+$$
+
+Because the policy is linear in the state, the update is fully transparent and easy to explain.
+
+## 5. Choosing and Explaining the Reward Coefficients
+
+The coefficients are not chosen arbitrarily. We perform a validation search over:
+
+- $\lambda \in \{10, 30\}$
+- $\phi \in \{0.005, 0.01, 0.02\}$
+- $\eta \in \{0.0005, 0.001\}$
+
+The validation objective is:
+
+$$
+\text{Validation Score} = \text{Sharpe} - 0.5 \times |\text{Max Drawdown}|
+$$
+
+This selection criterion intentionally rewards risk-adjusted return rather than raw return only.
+
+```{r reward-grid-top}
+reward_grid <- read_csv("outputs/reward_grid_results.csv", show_col_types = FALSE)
+kable(head(reward_grid, 6), digits = 4, caption = "Top Validation Results for Reward-Coefficient Selection")
+```
+
+The selected coefficients are:
+
+```{r chosen-reward}
+chosen_reward <- read_csv("outputs/chosen_reward_parameters.csv", show_col_types = FALSE)
+kable(chosen_reward, digits = 4, caption = "Chosen Reward Parameters")
+```
+
+Interpretation:
+
+- `transaction_cost = 0.0005` reflects ETF market friction in a liquid setting
+- `noise_sigma = 0.10` keeps exploration active during training
+- `max_weight = 0.70` prevents excessive concentration in one asset
+- `lambda = 10` penalizes unstable high-variance returns without dominating the reward
+- `phi = 0.02` puts meaningful pressure on drawdown control
+- `eta = 0.0005` discourages unnecessary trading while still allowing tactical shifts
+
+The validation result shows that stronger drawdown control helped, while too large a turnover penalty or too aggressive a risk penalty tended to reduce the validation score.
+
+## 6. Traditional Benchmarks
+
+To judge the RL strategy fairly, we compare it with several traditional portfolio rules:
+
+1. Buy-and-Hold Equal Weight: initial equal weights with no rebalance
+2. Monthly Equal Weight: rebalance to 25% each month
+3. Inverse Volatility: monthly rebalance with weights proportional to inverse 60-day volatility
+4. Minimum Variance: monthly rebalance using 60-day historical covariance and long-only constraints
+
+These benchmarks are transparent, interpretable, and standard in practical asset allocation.
+
+## 7. Descriptive and Modeling Figures
+
+### 7.1 Asset-Level Evidence
+
+```{r asset-price-figure, out.width="92%"}
+knitr::include_graphics("outputs/figures/asset_prices.png")
+```
+
+Figure 1 shows that the four ETFs have very different long-run growth paths and risk profiles, which motivates dynamic allocation rather than a fixed static portfolio.
+
+```{r rolling-vol-figure, out.width="92%"}
+knitr::include_graphics("outputs/figures/rolling_volatility.png")
+```
+
+Figure 2 confirms that volatility is clearly time-varying. This is one of the key reasons an adaptive policy can be economically meaningful.
+
+### 7.2 RL Training and Parameter Selection
+
+```{r reward-grid-figure, out.width="88%"}
+knitr::include_graphics("outputs/figures/reward_grid.png")
+```
+
+Figure 3 visualizes how the validation score changes across the candidate reward settings.
+
+```{r training-history-figure, out.width="88%"}
+knitr::include_graphics("outputs/figures/rl_training_history.png")
+```
+
+Figure 4 shows the validation Sharpe path across epochs. The training process is iterative rather than a one-step optimization.
+
+### 7.3 Allocation and Rebalancing Behavior
+
+```{r weight-path-figure, out.width="92%"}
+knitr::include_graphics("outputs/figures/rl_weight_path.png")
+```
+
+Figure 5 displays the RL portfolio weights through time on the test set. The weights are dynamic but remain diversified because of the long-only and max-weight constraints.
+
+```{r before-after-figure, out.width="78%"}
+knitr::include_graphics("outputs/figures/before_after_rebalance.png")
+```
+
+Figure 6 compares the average portfolio composition before and after RL rebalancing. This directly shows how the model changes the allocation rather than simply holding a fixed mix.
+
+## 8. Out-of-Sample Test Results
+
+```{r metrics-table}
+metrics_table <- read_csv("outputs/test_metrics_table.csv", show_col_types = FALSE)
+kable(metrics_table, digits = 4, caption = "Out-of-Sample Test Results")
+```
+
+```{r cum-wealth-figure, out.width="92%"}
+knitr::include_graphics("outputs/figures/test_cumulative_wealth.png")
+```
+
+```{r drawdown-figure, out.width="92%"}
+knitr::include_graphics("outputs/figures/test_drawdown.png")
+```
+
+The test results show a clear pattern.
+
+- RL achieves the highest total return: about 63.3%
+- RL also has the highest annualized return: about 28.6%
+- However, RL does not achieve the best Sharpe ratio
+- Inverse-volatility achieves the highest Sharpe ratio: about 1.51
+- Minimum-variance delivers the smallest maximum drawdown: about -5.9%
+- RL has much higher turnover than the traditional benchmarks
+
+This is exactly the type of result that should be discussed honestly in a final report. RL is strong at return generation and tactical adaptation, but the traditional risk-controlled models remain more stable on a risk-adjusted basis.
+
+## 9. Comparison Between "Before Rebalancing" and "After Rebalancing"
+
+There are two meaningful comparisons in this project.
+
+First, Buy-and-Hold Equal Weight represents the portfolio before systematic rebalancing. Monthly Equal Weight, Inverse Volatility, Minimum Variance, and RL represent different forms of rebalanced portfolios. This allows us to compare a passive portfolio against active reallocation rules.
+
+Second, within the RL strategy itself, Figure 6 compares the average weights before and after rebalancing. That figure shows the mechanism of the model: the policy reacts to state changes and shifts the portfolio accordingly.
+
+The empirical evidence suggests that rebalancing matters. The best-performing strategies in the test period are not the static ones. However, more active rebalancing also increases turnover and can increase drawdown if the strategy chases return too aggressively.
+
+## 10. Why RL Does Not Fully Replace Traditional Models
+
+The project provides several reasons why reinforcement learning should not be viewed as a full replacement for classical portfolio methods.
+
+First, traditional models remain easier to interpret. Equal-weight, inverse-volatility, and minimum-variance portfolios have clear economic intuition. Their behavior can be directly linked to risk budgeting and covariance structure.
+
+Second, RL is more sensitive to hyperparameters and reward design. Small changes in the drawdown penalty, turnover penalty, exploration noise, or learning rate can materially alter the result.
+
+Third, RL tends to trade more. In this experiment, the RL strategy has significantly higher average daily turnover than the benchmark models. That can erode realized performance in live trading if market impact is larger than assumed.
+
+Fourth, the RL strategy in this report achieves the highest raw return, but not the best Sharpe ratio or the smallest drawdown. This means the economic conclusion is mixed rather than one-sided.
+
+For these reasons, RL is better viewed as a complement to classical allocation methods. It can add tactical adaptation, but it should still be judged against transparent and robust benchmarks.
+
+## 11. Limitations
+
+This study has several limitations.
+
+1. The asset universe is small. Four ETFs give a clean and interpretable setting, but they do not span the full investable universe.
+2. The policy class is linear. This was a deliberate choice to keep the update transparent, but a linear policy cannot capture highly nonlinear state-action relationships.
+3. The reward function is hand-designed. Although economically motivated, it remains a modeling choice and can affect the final outcome.
+4. The validation scheme is based on one chronological split. More robust evidence would require rolling-origin or walk-forward validation.
+5. Transaction cost is simplified to a proportional turnover cost. Real execution frictions may be more complex.
+6. The state variables focus on market prices and rolling risk statistics only. Macroeconomic variables, term spreads, and liquidity indicators are not included.
+
+These limitations further support the conclusion that RL should not be treated as a universal replacement for traditional portfolio construction.
+
+## 12. Conclusion
+
+Using approximately ten years of daily ETF data, this project builds a transparent risk-sensitive reinforcement learning framework for tactical allocation across SPY, TQQQ, TLT, and GLD. The model explicitly shows the policy formula, the reward function, and the iterative update. The reward coefficients are selected on a validation set rather than chosen ad hoc.
+
+The final evidence is balanced. The RL strategy delivers the highest raw return on the test set, which suggests that adaptive timing and allocation can add value. At the same time, inverse-volatility and minimum-variance remain stronger in terms of Sharpe ratio and drawdown control. Therefore the main conclusion is not that RL dominates traditional models, but that RL is a useful extension that should be evaluated alongside them.
+
+## Appendix: Files Generated for This Report
+
+- `outputs/figures/asset_prices.png`
+- `outputs/figures/rolling_volatility.png`
+- `outputs/figures/reward_grid.png`
+- `outputs/figures/rl_training_history.png`
+- `outputs/figures/rl_weight_path.png`
+- `outputs/figures/before_after_rebalance.png`
+- `outputs/figures/test_cumulative_wealth.png`
+- `outputs/figures/test_drawdown.png`
+- `outputs/test_metrics_table.csv`
+- `outputs/reward_grid_results.csv`
+- `outputs/chosen_reward_parameters.csv`
